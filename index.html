@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>带库存的订单号抽奖</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif;margin:0;background:#f7f7f7;}
+  .wrap{max-width:600px;margin:60px auto;padding:20px;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);}
+  h1,h2{text-align:center;color:#333;}
+  input,button{padding:10px 14px;font-size:16px;border-radius:4px;border:1px solid #ccc;}
+  button{background:#007aff;color:#fff;border:none;cursor:pointer;margin-left:8px;}
+  button:disabled{background:#aaa;cursor:not-allowed;}
+  #result{margin-top:20px;font-size:20px;font-weight:bold;text-align:center;}
+  table{width:100%;border-collapse:collapse;margin-top:20px;}
+  th,td{padding:6px 10px;border-bottom:1px solid #eee;text-align:left;font-size:14px;}
+  .admin{display:none;}
+  .tab{display:flex;border-bottom:1px solid #ccc;margin-bottom:15px;}
+  .tab div{cursor:pointer;padding:8px 20px;}
+  .tab .active{border-bottom:2px solid #007aff;font-weight:bold;}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div class="tab">
+    <div class="active" onclick="switchTab('draw')">抽奖</div>
+    <div onclick="switchTab('admin')">后台</div>
+  </div>
+
+  <!-- ===== 抽奖面板 ===== -->
+  <div id="drawPanel">
+    <h1>🎁 订单号抽奖</h1>
+    <input id="orderInput" placeholder="请输入任意订单号" maxlength="30"/>
+    <button onclick="draw()">立即抽奖</button>
+    <div id="result"></div>
+  </div>
+
+  <!-- ===== 后台面板 ===== -->
+  <div id="adminPanel" class="admin">
+    <h2>后台数据</h2>
+    <button onclick="exportCSV()">导出 CSV</button>
+    <table id="adminTable">
+      <thead><tr><th>订单号</th><th>礼品</th><th>时间</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script type="module">
+/* ========= IndexedDB 封装 ========= */
+const DB_NAME = 'lotteryDB';
+const STORE_RECORDS = 'records';
+const STORE_STOCK = 'stock';
+let db;
+
+/* ===== 暗号解锁后台 ===== */
+const ADMIN_HASH = '#admin2025';          // 想换暗号改这里
+function unlockAdmin(){
+  localStorage.setItem('__admin', '1');
+  switchTab('admin');
+}
+function checkUnlock(){
+  if(location.hash === ADMIN_HASH){
+    unlockAdmin();
+    history.replaceState(null, '', location.pathname); // 清掉 # 避免泄露
+  }
+  if(localStorage.getItem('__admin') === '1'){
+    // 已解锁过，直接显示后台按钮
+    document.querySelector('.tab').style.display='flex';
+  }else{
+    // 未解锁，隐藏后台 Tab
+    document.querySelector('.tab').style.display='none';
+  }
+}
+checkUnlock();
+window.addEventListener('hashchange', checkUnlock);
+
+// 初始化数据库
+function openDB(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onerror = ()=>reject(req.error);
+    req.onsuccess = ()=>{ db = req.result; resolve(); };
+    req.onupgradeneeded = (e)=>{
+      const d = e.target.result;
+      if(!d.objectStoreNames.contains(STORE_RECORDS)){
+        d.createObjectStore(STORE_RECORDS, {keyPath:'order', unique:true});
+      }
+      if(!d.objectStoreNames.contains(STORE_STOCK)){
+        d.createObjectStore(STORE_STOCK, {keyPath:'gift'});
+      }
+    };
+  });
+}
+
+// 写入一条记录
+async function addRecord(order, gift){
+  const tx = db.transaction(STORE_RECORDS, 'readwrite');
+  tx.objectStore(STORE_RECORDS).put({order, gift, ts:Date.now()});
+  return tx.complete;
+}
+
+// 读取所有记录
+async function getAllRecords(){
+  return new Promise(res=>{
+    const tx = db.transaction(STORE_RECORDS, 'readonly');
+    const req = tx.objectStore(STORE_RECORDS).getAll();
+    req.onsuccess = ()=>res(req.result);
+  });
+}
+
+// 库存读写
+async function initStock(stocks){
+  const tx = db.transaction(STORE_STOCK, 'readwrite');
+  const store = tx.objectStore(STORE_STOCK);
+  for(const [gift,qty] of Object.entries(stocks)){
+    const exist = await new Promise(r=>{
+      const q = store.get(gift);
+      q.onsuccess = ()=>r(q.result);
+    });
+    if(!exist) store.put({gift, qty});
+  }
+  return tx.complete;
+}
+
+async function getStock(){
+  const all = await new Promise(res=>{
+    const tx = db.transaction(STORE_STOCK, 'readonly');
+    const req = tx.objectStore(STORE_STOCK).getAll();
+    req.onsuccess = ()=>res(req.result);
+  });
+  return Object.fromEntries(all.map(x=>[x.gift, x.qty]));
+}
+
+async function decreaseStock(gift){
+  const tx = db.transaction(STORE_STOCK, 'readwrite');
+  const store = tx.objectStore(STORE_STOCK);
+  const req = store.get(gift);
+  req.onsuccess = ()=>{
+    const item = req.result;
+    if(item && item.qty>0){
+      item.qty -= 1;
+      store.put(item);
+    }
+  };
+  return tx.complete;
+}
+
+/* ========= 业务逻辑 ========= */
+const initialStock = {
+  "iPhone 15": 1,
+  "Switch": 2,
+  "AirPods": 3,
+  "100元代金券": 5,
+  "50元代金券": 10,
+  "谢谢参与": 9999   // 永不缺货
+};
+
+// 伪随机
+function pseudoIndex(seed, len){
+  let h=0;
+  for(let i=0;i<seed.length;i++) h=((h<<5)-h+seed.charCodeAt(i))&0xffffffff;
+  return Math.abs(h)%len;
+}
+
+// 初始化
+await openDB();
+await initStock(initialStock);
+
+// 全局函数供 HTML 调用
+window.draw = async function(){
+  const order = document.getElementById('orderInput').value.trim();
+  if(!order){ alert('请输入订单号'); return; }
+
+  // 已抽过直接返回
+  const records = await getAllRecords();
+  const hit = records.find(r=>r.order===order);
+  if(hit){
+    document.getElementById('result').innerText = `该订单已抽中：${hit.gift}`;
+    return;
+  }
+
+  // 计算可用礼品
+  const stock = await getStock();
+  const available = Object.entries(stock).filter(([,q])=>q>0);
+  if(available.length===0){
+    document.getElementById('result').innerText = '所有礼品已发完！';
+    return;
+  }
+
+  const giftIdx = pseudoIndex(order, available.length);
+  const [gift] = available[giftIdx];
+
+  // 扣库存 & 写记录
+  await decreaseStock(gift);
+  await addRecord(order, gift);
+
+  document.getElementById('result').innerText = `订单号：${order}\n恭喜获得：${gift}！`;
+};
+
+// 后台展示
+window.switchTab = function(tab){
+  document.querySelectorAll('.tab div').forEach(d=>d.classList.remove('active'));
+  document.querySelector(`.tab div[onclick*="${tab}"]`).classList.add('active');
+  if(tab==='admin'){
+    document.getElementById('drawPanel').style.display='none';
+    document.getElementById('adminPanel').style.display='block';
+    refreshAdmin();
+  }else{
+    document.getElementById('drawPanel').style.display='block';
+    document.getElementById('adminPanel').style.display='none';
+  }
+};
+
+async function refreshAdmin(){
+  const rows = await getAllRecords();
+  const tbody = document.querySelector('#adminTable tbody');
+  tbody.innerHTML='';
+  rows.sort((a,b)=>b.ts-a.ts).forEach(r=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${r.order}</td><td>${r.gift}</td><td>${new Date(r.ts).toLocaleString()}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+window.exportCSV = async function(){
+  const rows = await getAllRecords();
+  const csv = '订单号,礼品,时间\n' + 
+        rows.map(r=>`"${r.order}","${r.gift}",${new Date(r.ts).toISOString()}`).join('\n');
+  const blob = new Blob([csv],{type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download='lottery_records.csv'; a.click();
+  URL.revokeObjectURL(url);
+};
+</script>
+
+</body>
+</html>
+
+
